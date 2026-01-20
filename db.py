@@ -300,28 +300,20 @@ def jobs_report_rows() -> List[Dict[str, Any]]:
             return list(cur.fetchall())
 
 
-def followups_due_rows() -> List[Dict[str, Any]]:
-    """
-    Follow-ups due today or earlier, excluding finished jobs.
-    """
+def followups_due_rows(today):
     user_email = _get_user_email()
     with _pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                select
-                  id,
-                  company,
-                  title,
-                  status,
-                  to_char(followup_date, 'MM/DD/YYYY') as followup_date
+                select id, company, title, followup_date, status
                 from jobs
                 where user_email = %s
                   and followup_date is not null
-                  and followup_date <= current_date
-                  and (finished_date is null)
-                order by followup_date asc, id desc;
+                  and followup_date <= %s
+                order by followup_date asc
                 """,
-                (user_email,),
+                (user_email, today),
             )
-            return list(cur.fetchall())
+            return cur.fetchall()
+
