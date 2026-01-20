@@ -317,3 +317,5 @@ def followups_due_rows(today):
             )
             return cur.fetchall()
 
+
+
