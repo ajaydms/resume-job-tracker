@@ -1,231 +1,327 @@
+import os
 import sqlite3
-from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-DB_PATH = Path("jobs.db")
+import streamlit as st
 
-
-def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Postgres (Supabase)
+import psycopg
+from psycopg.rows import dict_row
 
 
-def _column_exists(conn, table: str, col: str) -> bool:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"] == col for r in rows)
+# ---------- Connection helpers ----------
 
+def _get_db_url() -> str:
+    # Prefer Streamlit Cloud secrets, fallback to env for local
+    url = ""
+    try:
+        if "SUPABASE_DB_URL" in st.secrets:
+            url = st.secrets["SUPABASE_DB_URL"]
+    except Exception:
+        pass
+
+    if not url:
+        url = os.getenv("SUPABASE_DB_URL", "")
+
+    return (url or "").strip()
+
+
+def _get_user_email() -> str:
+    # app.py should set st.session_state["current_user_email"]
+    # fallback keeps app from crashing
+    email = st.session_state.get("current_user_email", "default").strip().lower()
+    return email or "default"
+
+
+def _pg_conn():
+    url = _get_db_url()
+    if not url:
+        raise RuntimeError("Missing SUPABASE_DB_URL. Add it to Streamlit Secrets.")
+    return psycopg.connect(url, row_factory=dict_row)
+
+
+# ---------- Schema init (safe) ----------
 
 def init_db():
-    conn = _connect()
-    cur = conn.cursor()
-
-    # resumes
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS resumes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        resume_text TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    """)
-
-    # jobs
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company TEXT NOT NULL,              -- we use this as "Job Name" label
-        title TEXT,
-        location TEXT,
-        url TEXT,
-        jd_text TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'Target',
-        status_date TEXT,                  -- <-- NEW: date corresponding to current status
-        applied_date TEXT,
-        followup_date TEXT,
-        finished_date TEXT,
-        finished_outcome TEXT,
-        notes TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    """)
-
-    # versions
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS versions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id INTEGER NOT NULL,
-        base_resume_id INTEGER NOT NULL,
-        version_name TEXT NOT NULL,
-        tailored_resume TEXT NOT NULL,
-        changes_summary TEXT,
-        suggested_additions TEXT,
-        accuracy_checklist TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        FOREIGN KEY(job_id) REFERENCES jobs(id),
-        FOREIGN KEY(base_resume_id) REFERENCES resumes(id)
-    )
-    """)
-
-    # ---- Migrations (for older DBs) ----
-    for col, ddl in [
-        ("status_date", "ALTER TABLE jobs ADD COLUMN status_date TEXT"),
-        ("applied_date", "ALTER TABLE jobs ADD COLUMN applied_date TEXT"),
-        ("followup_date", "ALTER TABLE jobs ADD COLUMN followup_date TEXT"),
-        ("finished_date", "ALTER TABLE jobs ADD COLUMN finished_date TEXT"),
-        ("finished_outcome", "ALTER TABLE jobs ADD COLUMN finished_outcome TEXT"),
-        ("notes", "ALTER TABLE jobs ADD COLUMN notes TEXT"),
-    ]:
-        if not _column_exists(conn, "jobs", col):
-            cur.execute(ddl)
-
-    conn.commit()
-    conn.close()
+    """
+    On Postgres, we assume tables are created in Supabase SQL editor.
+    This function just validates connectivity.
+    """
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select 1;")
+                _ = cur.fetchone()
+    except Exception as e:
+        raise RuntimeError(f"Could not connect to Supabase/Postgres: {e}")
 
 
 # ---------- Resumes ----------
+
 def insert_resume(name: str, resume_text: str) -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO resumes(name, resume_text) VALUES (?, ?)", (name, resume_text))
-    conn.commit()
-    rid = cur.lastrowid
-    conn.close()
-    return rid
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into resumes (user_email, name, resume_text)
+                values (%s, %s, %s)
+                returning id;
+                """,
+                (user_email, name.strip(), resume_text),
+            )
+            rid = cur.fetchone()["id"]
+        conn.commit()
+    return int(rid)
 
 
-def list_resumes():
-    conn = _connect()
-    rows = conn.execute("SELECT id, name FROM resumes ORDER BY id DESC").fetchall()
-    conn.close()
-    return rows
+def list_resumes() -> List[Dict[str, Any]]:
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, name, created_at
+                from resumes
+                where user_email = %s
+                order by id desc;
+                """,
+                (user_email,),
+            )
+            return list(cur.fetchall())
 
 
-def get_resume(resume_id: int):
-    conn = _connect()
-    row = conn.execute("SELECT * FROM resumes WHERE id=?", (resume_id,)).fetchone()
-    conn.close()
-    return row
+def get_resume(resume_id: int) -> Dict[str, Any]:
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, name, resume_text, created_at
+                from resumes
+                where user_email = %s and id = %s
+                limit 1;
+                """,
+                (user_email, int(resume_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise KeyError("Resume not found.")
+            return dict(row)
 
 
 # ---------- Jobs ----------
-def insert_job(company: str, title: str, location: str, url: str, jd_text: str) -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO jobs(company, title, location, url, jd_text)
-        VALUES (?, ?, ?, ?, ?)
-    """, (company, title, location, url, jd_text))
-    conn.commit()
-    jid = cur.lastrowid
-    conn.close()
-    return jid
 
-
-def list_jobs():
-    conn = _connect()
-    rows = conn.execute("SELECT id, company, status FROM jobs ORDER BY id DESC").fetchall()
-    conn.close()
-    return rows
-
-
-def get_job(job_id: int):
-    conn = _connect()
-    row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def update_job_status(job_id: int, status: str, status_date: str = ""):
+def insert_job(company: str, title: str, location: str, url: str, jd_text: str, status: str = "Target") -> int:
     """
-    status_date should be ISO date string YYYY-MM-DD or "".
-    We also auto-fill applied_date/finished_date when relevant.
+    company is used as the "Job Name" in your UI.
     """
-    conn = _connect()
-    cur = conn.cursor()
-
-    cur.execute("UPDATE jobs SET status=?, status_date=? WHERE id=?", (status, status_date, job_id))
-
-    # If status is Applied and applied_date isn't set, set it
-    if status == "Applied" and status_date:
-        cur.execute("""
-            UPDATE jobs
-            SET applied_date = CASE WHEN applied_date IS NULL OR applied_date='' THEN ? ELSE applied_date END
-            WHERE id=?
-        """, (status_date, job_id))
-
-    # If status is Finished and finished_date isn't set, set it
-    if status == "Finished" and status_date:
-        cur.execute("""
-            UPDATE jobs
-            SET finished_date = CASE WHEN finished_date IS NULL OR finished_date='' THEN ? ELSE finished_date END
-            WHERE id=?
-        """, (status_date, job_id))
-
-    conn.commit()
-    conn.close()
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into jobs (user_email, company, title, location, url, jd_text, status)
+                values (%s, %s, %s, %s, %s, %s, %s)
+                returning id;
+                """,
+                (user_email, company.strip(), title.strip(), location.strip(), url.strip(), jd_text, status),
+            )
+            jid = cur.fetchone()["id"]
+        conn.commit()
+    return int(jid)
 
 
-def update_job_dates(job_id: int, applied_date: str, followup_date: str, finished_date: str, finished_outcome: str, notes: str):
-    conn = _connect()
-    conn.execute("""
-        UPDATE jobs
-        SET applied_date=?, followup_date=?, finished_date=?, finished_outcome=?, notes=?
-        WHERE id=?
-    """, (applied_date, followup_date, finished_date, finished_outcome, notes, job_id))
-    conn.commit()
-    conn.close()
+def list_jobs() -> List[Dict[str, Any]]:
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, company, title, location, url, status,
+                       applied_date, followup_date, finished_date, finished_outcome, notes, created_at
+                from jobs
+                where user_email = %s
+                order by id desc;
+                """,
+                (user_email,),
+            )
+            return list(cur.fetchall())
+
+
+def get_job(job_id: int) -> Dict[str, Any]:
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select *
+                from jobs
+                where user_email = %s and id = %s
+                limit 1;
+                """,
+                (user_email, int(job_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise KeyError("Job not found.")
+            return dict(row)
+
+
+def update_job_status(job_id: int, status: str, status_date=None):
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                update jobs
+                set status = %s,
+                    status_date = %s
+                where user_email = %s and id = %s;
+                """,
+                (status, status_date, user_email, int(job_id)),
+            )
+        conn.commit()
+
+
+def update_job_reporting_dates(
+    job_id: int,
+    applied_date=None,
+    followup_date=None,
+    finished_date=None,
+    finished_outcome: str = "",
+    notes: str = "",
+):
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                update jobs
+                set applied_date = %s,
+                    followup_date = %s,
+                    finished_date = %s,
+                    finished_outcome = %s,
+                    notes = %s
+                where user_email = %s and id = %s;
+                """,
+                (applied_date, followup_date, finished_date, finished_outcome.strip(), notes.strip(), user_email, int(job_id)),
+            )
+        conn.commit()
 
 
 # ---------- Versions ----------
-def insert_version(job_id: int, base_resume_id: int, version_name: str, tailored_resume: str,
-                   changes_summary: str, suggested_additions: str, accuracy_checklist: str) -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO versions(job_id, base_resume_id, version_name, tailored_resume, changes_summary, suggested_additions, accuracy_checklist)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, base_resume_id, version_name, tailored_resume, changes_summary, suggested_additions, accuracy_checklist))
-    conn.commit()
-    vid = cur.lastrowid
-    conn.close()
-    return vid
+
+def insert_version(
+    job_id: int,
+    base_resume_id: int,
+    version_name: str,
+    tailored_resume: str,
+    changes_summary: str,
+    suggested_additions: str,
+    accuracy_checklist: str,
+) -> int:
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into versions
+                  (user_email, job_id, base_resume_id, version_name, tailored_resume,
+                   changes_summary, suggested_additions, accuracy_checklist)
+                values
+                  (%s, %s, %s, %s, %s, %s, %s, %s)
+                returning id;
+                """,
+                (
+                    user_email,
+                    int(job_id),
+                    int(base_resume_id),
+                    version_name.strip(),
+                    tailored_resume,
+                    changes_summary,
+                    suggested_additions,
+                    accuracy_checklist,
+                ),
+            )
+            vid = cur.fetchone()["id"]
+        conn.commit()
+    return int(vid)
 
 
-def list_versions_for_job(job_id: int):
-    conn = _connect()
-    rows = conn.execute("""
-        SELECT v.*, r.name AS resume_name
-        FROM versions v
-        JOIN resumes r ON r.id = v.base_resume_id
-        WHERE v.job_id=?
-        ORDER BY v.id DESC
-    """, (job_id,)).fetchall()
-    conn.close()
-    return rows
+def list_versions_for_job(job_id: int) -> List[Dict[str, Any]]:
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select v.id, v.version_name, v.tailored_resume, v.created_at,
+                       r.name as resume_name
+                from versions v
+                join resumes r on r.id = v.base_resume_id
+                where v.user_email = %s and v.job_id = %s
+                order by v.id desc;
+                """,
+                (user_email, int(job_id)),
+            )
+            return list(cur.fetchall())
 
 
-# ---------- Reporting ----------
-def jobs_report_rows():
-    conn = _connect()
-    rows = conn.execute("""
-        SELECT id, company, status, status_date, applied_date, followup_date, finished_date, finished_outcome, notes, created_at
-        FROM jobs
-        ORDER BY id DESC
-    """).fetchall()
-    conn.close()
-    return rows
+# ---------- Reports helpers ----------
+
+def jobs_report_rows() -> List[Dict[str, Any]]:
+    """
+    Used by Reports tab to export a full jobs table.
+    """
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                  id as "Job ID",
+                  company as "Job Name",
+                  title as "Title",
+                  location as "Location",
+                  url as "URL",
+                  status as "Status",
+                  to_char(applied_date, 'MM/DD/YYYY') as "Applied Date",
+                  to_char(followup_date, 'MM/DD/YYYY') as "Follow up Date",
+                  to_char(finished_date, 'MM/DD/YYYY') as "Finished Date",
+                  finished_outcome as "Finished Outcome",
+                  notes as "Notes",
+                  to_char(created_at, 'MM/DD/YYYY') as "Created Date"
+                from jobs
+                where user_email = %s
+                order by id desc;
+                """,
+                (user_email,),
+            )
+            return list(cur.fetchall())
 
 
-def followups_due_rows(today_iso: str):
-    conn = _connect()
-    rows = conn.execute("""
-        SELECT id, company, status, followup_date
-        FROM jobs
-        WHERE followup_date IS NOT NULL
-          AND followup_date <> ''
-          AND followup_date <= ?
-          AND status <> 'Finished'
-        ORDER BY followup_date ASC
-    """, (today_iso,)).fetchall()
-    conn.close()
-    return rows
+def followups_due_rows() -> List[Dict[str, Any]]:
+    """
+    Follow-ups due today or earlier, excluding finished jobs.
+    """
+    user_email = _get_user_email()
+    with _pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                  id,
+                  company,
+                  title,
+                  status,
+                  to_char(followup_date, 'MM/DD/YYYY') as followup_date
+                from jobs
+                where user_email = %s
+                  and followup_date is not null
+                  and followup_date <= current_date
+                  and (finished_date is null)
+                order by followup_date asc, id desc;
+                """,
+                (user_email,),
+            )
+            return list(cur.fetchall())
