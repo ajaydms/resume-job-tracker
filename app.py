@@ -148,7 +148,25 @@ accuracy_checklist (array of strings)
 
 # -------------------- UI --------------------
 st.title("Executive Job Tracker + Resume Tailor")
+
+# -------- User context (multi-user ready) --------
+
+st.sidebar.header("User")
+
+current_user = st.sidebar.text_input(
+    "Current user email",
+    value="ajay@dmsapiens.com"
+).strip().lower()
+
+if not current_user:
+    st.stop()
+
+st.session_state["current_user_email"] = current_user
+
+# -----------------------------------------------
+
 tabs_top = st.tabs(["Tracker", "Reports"])
+
 
 # =========================================================
 # TAB 1: TRACKER
@@ -511,3 +529,4 @@ with tabs_top[1]:
         )
     except Exception:
         st.info("Excel export needs openpyxl. Install with:  py -3.12 -m pip install openpyxl")
+
